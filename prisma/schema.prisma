@@ -1,0 +1,269 @@
+// Caminet — Prisma Schema
+// Equipment Tracking Application for 35 Stripes Film & Production
+// Phase 2 — Full data model
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider          = "postgresql"
+  url               = env("DATABASE_URL")
+  directUrl         = env("DIRECT_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  ADMIN
+  PIC
+  CREW
+}
+
+enum EquipmentStatus {
+  AVAILABLE
+  IN_USE
+  UNDER_MAINTENANCE
+  RETIRED
+  REPORTED
+}
+
+enum EquipmentCategory {
+  CAMERA
+  LENS
+  LIGHTING
+  AUDIO
+  GRIP
+  STORAGE
+  ACCESSORIES
+  OTHER
+}
+
+enum EquipmentCondition {
+  EXCELLENT
+  GOOD
+  FAIR
+  POOR
+}
+
+enum TransactionType {
+  CHECK_IN
+  CHECK_OUT
+}
+
+enum SyncStatus {
+  SYNCED
+  CONFLICT
+}
+
+enum ShootStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum NotificationType {
+  OVERDUE_RETURN
+  SYNC_CONFLICT
+  SYSTEM_ALERT
+  ISSUE_REPORTED
+}
+
+enum IssueStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+}
+
+enum IssueType {
+  DAMAGE
+  MALFUNCTION
+  MISSING_PART
+  GENERAL
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Models
+// ─────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name          String
+  email         String    @unique
+  passwordHash  String
+  role          UserRole
+  mfaEnabled    Boolean   @default(false)
+  mfaSecret     String?   // TOTP secret — encrypted with HMAC_TAG_SECRET before storage
+  fcmToken      String?   // Firebase device token for push notifications
+  isActive      Boolean   @default(true)
+  deactivatedAt DateTime? @db.Timestamptz
+  createdAt     DateTime  @default(now()) @db.Timestamptz
+
+  // Relations
+  transactions      Transaction[]
+  notifications     Notification[]
+  shootsCrew        ShootCrew[]
+  issueReports      IssueReport[]
+  templates         EventTemplate[]
+  refreshTokens     RefreshToken[]
+  lastCheckedItems  Equipment[]     @relation("LastCheckedBy")
+
+  @@map("users")
+}
+
+model Equipment {
+  id              String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name            String
+  category        EquipmentCategory
+  status          EquipmentStatus    @default(AVAILABLE)
+  condition       EquipmentCondition
+  qrCode          String?            @unique
+  rfidTag         String?            @unique
+  location        String
+  tags            String[]
+  lastCheckedById String?            @db.Uuid
+  lastCheckedBy   User?              @relation("LastCheckedBy", fields: [lastCheckedById], references: [id])
+  isActive        Boolean            @default(true)
+  deactivatedAt   DateTime?          @db.Timestamptz
+  createdAt       DateTime           @default(now()) @db.Timestamptz
+
+  // Relations
+  transactions      Transaction[]
+  shootEquipment    ShootEquipment[]
+  templateEquipment TemplateEquipment[]
+  issueReports      IssueReport[]
+
+  @@map("equipment")
+}
+
+// Immutable audit log — no updates, only inserts
+model Transaction {
+  id           String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  clientId     String          @unique // iOS-generated UUID — idempotency key
+  userId       String          @db.Uuid
+  user         User            @relation(fields: [userId], references: [id])
+  equipmentId  String          @db.Uuid
+  equipment    Equipment       @relation(fields: [equipmentId], references: [id])
+  type         TransactionType
+  timestamp    DateTime        @db.Timestamptz // device timestamp at scan time
+  syncedAt     DateTime        @default(now()) @db.Timestamptz
+  syncStatus   SyncStatus      @default(SYNCED)
+  location     String?
+  conflictNote String?         // populated if a conflict was auto-resolved
+
+  @@index([equipmentId, timestamp])
+  @@index([userId, timestamp])
+  @@map("transactions")
+}
+
+model Shoot {
+  id         String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name       String
+  date       DateTime      @db.Timestamptz
+  endDate    DateTime      @db.Timestamptz // for overlap conflict detection
+  location   String
+  templateId String?       @db.Uuid
+  template   EventTemplate? @relation(fields: [templateId], references: [id])
+  status     ShootStatus   @default(SCHEDULED)
+  createdAt  DateTime      @default(now()) @db.Timestamptz
+
+  // Relations
+  equipment ShootEquipment[]
+  crew      ShootCrew[]
+
+  @@map("shoots")
+}
+
+model ShootEquipment {
+  shootId     String    @db.Uuid
+  shoot       Shoot     @relation(fields: [shootId], references: [id], onDelete: Cascade)
+  equipmentId String    @db.Uuid
+  equipment   Equipment @relation(fields: [equipmentId], references: [id])
+
+  @@id([shootId, equipmentId])
+  @@map("shoot_equipment")
+}
+
+model ShootCrew {
+  shootId String @db.Uuid
+  shoot   Shoot  @relation(fields: [shootId], references: [id], onDelete: Cascade)
+  userId  String @db.Uuid
+  user    User   @relation(fields: [userId], references: [id])
+
+  @@id([shootId, userId])
+  @@map("shoot_crew")
+}
+
+model EventTemplate {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name        String
+  description String?
+  createdById String   @db.Uuid
+  createdBy   User     @relation(fields: [createdById], references: [id])
+  createdAt   DateTime @default(now()) @db.Timestamptz
+
+  // Relations
+  equipment TemplateEquipment[]
+  shoots    Shoot[]
+
+  @@map("event_templates")
+}
+
+model TemplateEquipment {
+  templateId  String        @db.Uuid
+  template    EventTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  equipmentId String        @db.Uuid
+  equipment   Equipment     @relation(fields: [equipmentId], references: [id])
+
+  @@id([templateId, equipmentId])
+  @@map("template_equipment")
+}
+
+model Notification {
+  id        String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String           @db.Uuid
+  user      User             @relation(fields: [userId], references: [id])
+  type      NotificationType
+  message   String
+  isRead    Boolean          @default(false)
+  metadata  Json?            // optional payload (e.g. equipmentId, transactionId)
+  createdAt DateTime         @default(now()) @db.Timestamptz
+
+  @@index([userId, isRead])
+  @@map("notifications")
+}
+
+model IssueReport {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  equipmentId  String      @db.Uuid
+  equipment    Equipment   @relation(fields: [equipmentId], references: [id])
+  reportedById String      @db.Uuid
+  reportedBy   User        @relation(fields: [reportedById], references: [id])
+  issueType    IssueType
+  description  String
+  photoUrl     String?     // Cloudinary URL
+  status       IssueStatus @default(OPEN)
+  resolvedNote String?
+  createdAt    DateTime    @default(now()) @db.Timestamptz
+  updatedAt    DateTime    @updatedAt @db.Timestamptz
+
+  @@index([equipmentId, status])
+  @@map("issue_reports")
+}
+
+// Stores hashed refresh tokens for token rotation
+model RefreshToken {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId      String   @db.Uuid
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash   String   @unique // bcrypt hash of the refresh token
+  deviceInfo  String?  // User-Agent or device identifier
+  expiresAt   DateTime @db.Timestamptz
+  createdAt   DateTime @default(now()) @db.Timestamptz
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
